@@ -117,6 +117,203 @@ Key tables:
 
 ---
 
+## Layered Backend Architecture
+
+Every HTTP request travels through a strict set of layers. Each layer has a single responsibility and only depends on the layer directly below it.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Frontend (React / Next.js)                   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │          Generated API Client (openapi-typescript)      │    │
+│  │   • Typed request/response models from OpenAPI spec     │    │
+│  │   • No hand-written fetch calls; contract-first         │    │
+│  └───────────────────────────┬─────────────────────────────┘    │
+└──────────────────────────────│──────────────────────────────────┘
+                               │  HTTPS / REST JSON
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        Controller Layer                         │
+│  TracksController · OrdersController · AuthController …        │
+│                                                                 │
+│  • Route binding & input validation (FluentValidation)          │
+│  • Returns ActionResult – no business logic here               │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │  Calls service interfaces (DI)
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       Service Layer                             │
+│  ITrackService · IOrderService · ILicenseService …             │
+│                                                                 │
+│  • Orchestrates use-cases (e.g. CreateOrder)                    │
+│  • Enforces business rules & authorization policies             │
+│  • Calls domain services and repositories                       │
+└──────────────────────┬────────────────────────┬─────────────────┘
+                       │                        │
+                       ▼                        ▼
+┌──────────────────────────────┐  ┌─────────────────────────────┐
+│       Domain Services        │  │       External Adapters     │
+│  PricingService              │  │  StripeAdapter              │
+│  LicenseValidationService    │  │  S3StorageAdapter           │
+│  PreviewGenerationService    │  │  EmailAdapter               │
+│                              │  │                             │
+│  • Pure business logic        │  │  • Anti-corruption layer    │
+│  • No I/O; fully testable     │  │  • Wraps third-party SDKs  │
+└──────────────────────┬───────┘  └─────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       Repository Layer                          │
+│  ITrackRepository · IOrderRepository · IUserRepository …       │
+│                                                                 │
+│  • EF Core – single Unit of Work per request                    │
+│  • Returns domain entities; no raw SQL exposed above this layer │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │  EF Core / Npgsql
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                          PostgreSQL                             │
+│  users · tracks · track_files · licenses · orders · payouts    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## API Client Generation Flow
+
+The frontend never hand-writes API calls. The OpenAPI spec is the single source of truth and the client is regenerated on every backend change.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Backend (ASP.NET Core)                                      │
+│  Swashbuckle auto-generates OpenAPI 3.0 spec on build        │
+└────────────────────────────┬─────────────────────────────────┘
+                             │  openapi.json (versioned in repo)
+                             ▼
+┌──────────────────────────────────────────────────────────────┐
+│  CI Step: "Generate API Client"                              │
+│  npx openapi-typescript openapi.json --output src/api/types  │
+│  npx openapi-fetch codegen …                                 │
+│                                                              │
+│  Outputs:                                                    │
+│    src/api/types.ts       ← TypeScript types                 │
+│    src/api/client.ts      ← Typed fetch wrapper              │
+└────────────────────────────┬─────────────────────────────────┘
+                             │  Imported by React components
+                             ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Frontend Component                                          │
+│  const { data } = useQuery(apiClient.GET("/tracks/{id}", …)) │
+│  // TypeScript error if response shape doesn't match types   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Why this matters:** a breaking API change produces a TypeScript compile error in CI before any code reaches production.
+
+---
+
+## Domain Model
+
+```
+┌──────────┐       ┌────────────────┐       ┌──────────────┐
+│  User    │──────<│  Track         │──────<│  TrackFile   │
+│          │       │                │       │              │
+│ id       │       │ id             │       │ id           │
+│ email    │       │ creatorId (FK) │       │ trackId (FK) │
+│ role     │       │ title          │       │ fileType     │
+│ stripeId │       │ genre          │       │ s3Key        │
+└──────────┘       │ bpm            │       │ durationSec  │
+                   │ key            │       └──────────────┘
+                   └───────┬────────┘
+                           │ 1
+                           │ has many
+                           ▼ *
+                   ┌───────────────┐
+                   │  License      │
+                   │               │
+                   │ id            │
+                   │ trackId (FK)  │
+                   │ type          │
+                   │ price         │
+                   └───────┬───────┘
+                           │ purchased via
+                           ▼
+                   ┌───────────────┐       ┌──────────────┐
+                   │  OrderItem    │──────>│  Order       │
+                   │               │       │              │
+                   │ id            │       │ id           │
+                   │ orderId (FK)  │       │ buyerId (FK) │
+                   │ licenseId (FK)│       │ status       │
+                   │ price         │       │ total        │
+                   └───────────────┘       │ stripeSession│
+                                           └──────┬───────┘
+                                                  │ fulfilled by
+                                                  ▼
+                                           ┌──────────────┐
+                                           │  Payout      │
+                                           │              │
+                                           │ id           │
+                                           │ creatorId(FK)│
+                                           │ amount       │
+                                           │ status       │
+                                           └──────────────┘
+```
+
+---
+
+## CI Enforcement Pipeline
+
+```
+ Git push / Pull Request
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Stage 1 – Static Analysis & Contracts                      │
+│                                                             │
+│  ┌─────────────────┐  ┌──────────────────────────────────┐  │
+│  │ dotnet build    │  │ npm run type-check               │  │
+│  │ (0 warnings     │  │ (TypeScript strict mode;         │  │
+│  │  policy)        │  │  generated client must compile)  │  │
+│  └─────────────────┘  └──────────────────────────────────┘  │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  Regenerate API client from OpenAPI spec            │    │
+│  │  → fail if generated output differs from committed  │    │
+│  └─────────────────────────────────────────────────────┘    │
+└────────────────────────────┬────────────────────────────────┘
+                             │  All checks pass
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Stage 2 – Automated Tests                                  │
+│                                                             │
+│  ┌────────────────┐  ┌──────────────┐  ┌─────────────────┐  │
+│  │ Unit Tests     │  │ Integration  │  │ Frontend Tests  │  │
+│  │ (xUnit)        │  │ Tests        │  │ (Jest /         │  │
+│  │ Domain + Svc   │  │ (Testcontain-│  │  React Testing  │  │
+│  │ layer only     │  │  ers + real  │  │  Library)       │  │
+│  │                │  │  PostgreSQL) │  │                 │  │
+│  └────────────────┘  └──────────────┘  └─────────────────┘  │
+└────────────────────────────┬────────────────────────────────┘
+                             │  All tests pass
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Stage 3 – Build & Publish Docker Images                    │
+│  Push to ECR → Update ECS task definitions                  │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Stage 4 – Deploy to Staging                                │
+│  Rolling update → smoke tests → manual approval gate        │
+│                            │                                │
+│                            ▼                                │
+│                    Deploy to Production                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Deployment
 
 See [`deployment.md`](deployment.md) for infrastructure and deployment details.
