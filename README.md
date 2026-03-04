@@ -77,7 +77,7 @@ cambrian-demo
 
 ## Documentation
 
-- [Architecture](docs/architecture.md)
+- [Architecture](docs/architecture.md) – high-level diagram, layered backend architecture, API client generation flow, domain model, and CI enforcement pipeline
 - [API Design](docs/api-design.md)
 - [Deployment](docs/deployment.md)
 
